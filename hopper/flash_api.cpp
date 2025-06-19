@@ -66,7 +66,8 @@ void set_params_fprop(Flash_fwd_params &params,
                       int window_size_right,
                       int attention_chunk,
                       const float softcap=0.f,
-                      const int sm_margin=0) {
+                      const int sm_margin=0,
+                      void *visible_indices) {
 
     // Reset the parameters
     params = {};
@@ -157,6 +158,8 @@ void set_params_fprop(Flash_fwd_params &params,
     #ifdef FLASHATTENTION_DISABLE_LOCAL
         TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
     #endif
+
+    params.visible_indices = visible_indices;
 }
 
 void set_params_dgrad(Flash_bwd_params &params,
@@ -211,7 +214,8 @@ void set_params_dgrad(Flash_bwd_params &params,
                      window_size_right,
                      attention_chunk,
                      softcap,
-                     sm_margin);
+                     sm_margin,
+                     params.visible_indices);
 
     // Set the pointers and strides.
     params.do_ptr = dout.data_ptr();
@@ -638,6 +642,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
         at::Tensor k,  // (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table.
         at::Tensor v,  // (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table.
+        at::Tensor visible_indices,  // 新增参数
         std::optional<at::Tensor> k_new_,  // (b, s_k_new, h_k, d) or (total_k_new, h_k, d) if there is cu_seqlens_k_new
         std::optional<at::Tensor> v_new_,  // (b, s_k_new, h_k, dv) or (total_k_new, h_k, dv) if there is cu_seqlens_k_new
         std::optional<at::Tensor> q_v_,  // (b, s_q, h, dv) or (total_q_new, h, dv) if there is cu_seqlens_q
@@ -875,7 +880,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
                      window_size_right,
                      attention_chunk,
                      softcap,
-                     sm_margin);
+                     sm_margin,
+                     visible_indices.data_ptr());
     params.total_q = total_q;
     params.total_k = total_k;
     params.b_k = batch_size_k;
@@ -1471,7 +1477,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
                      0,  // attention_chunk
                      softcap,
                      deterministic,
-                     sm_margin);
+                     sm_margin,
+                     visible_indices.data_ptr());
     params.total_q = total_q;
     params.total_k = total_k;
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
@@ -1622,6 +1629,7 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor q,"
         "Tensor k,"
         "Tensor v,"
+        "Tensor visible_indices,"
         "Tensor(k_new!)? k_new = None,"
         "Tensor(v_new!)? v_new = None,"
         "Tensor? q_v = None,"
@@ -1706,6 +1714,21 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
         "int sm_margin = 0) -> Tensor");
+    m.def(R"(
+        custom_mask_varlen_fwd(
+            Tensor q,
+            Tensor k,
+            Tensor v,
+            Tensor visible_indices,
+            Tensor cu_seqlens_q,
+            Tensor cu_seqlens_k,
+            Tensor seqused_q,
+            Tensor seqused_k,
+            int max_seqlen_q,
+            int max_seqlen_k,
+            float? softmax_scale,
+            bool causal) -> (Tensor, Tensor)
+    )");
 }
 
 TORCH_LIBRARY_IMPL(flash_attn_3, CUDA, m) {
@@ -1713,4 +1736,40 @@ TORCH_LIBRARY_IMPL(flash_attn_3, CUDA, m) {
     m.impl("bwd", &mha_bwd);
     m.impl("fwd_combine", &mha_combine);
     m.impl("get_scheduler_metadata", &mha_fwd_get_scheduler_metadata);
+    m.impl("custom_mask_varlen_fwd", 
+           TORCH_FN([]( // 使用 lambda 包装 mha_fwd
+               const at::Tensor& q,
+               const at::Tensor& k,
+               const at::Tensor& v,
+               const at::Tensor& visible_indices,
+               const at::Tensor& cu_seqlens_q,
+               const at::Tensor& cu_seqlens_k,
+               const at::Tensor& seqused_q,
+               const at::Tensor& seqused_k,
+               int64_t max_seqlen_q,
+               int64_t max_seqlen_k,
+               c10::optional<double> softmax_scale,
+               bool causal
+           ) {
+               return mha_fwd(q, k, v, visible_indices,
+                            {}, {}, {}, {}, // k_new, v_new, q_v, out
+                            cu_seqlens_q, cu_seqlens_k,
+                            {}, // cu_seqlens_k_new
+                            seqused_q, seqused_k,
+                            max_seqlen_q, max_seqlen_k,
+                            {}, {}, {}, // page_table, kv_batch_idx, leftpad_k
+                            {}, {}, {}, // rotary_cos, rotary_sin, seqlens_rotary
+                            {}, {}, {}, // q_descale, k_descale, v_descale
+                            softmax_scale,
+                            causal,
+                            -1, -1, // window_size
+                            0,  // attention_chunk
+                            0.0, // softcap
+                            true, // is_rotary_interleaved
+                            {}, // scheduler_metadata
+                            1,  // num_splits
+                            {}, // pack_gqa
+                            0   // sm_margin
+                           );
+           }));
 }

@@ -439,6 +439,146 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
+class FlashAttnCustomMaskVarlenFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        visible_indices,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale=None,
+        causal=False,
+    ):
+        # 类型和设备检查
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+            
+        # 确保输入数据类型正确
+        visible_indices = visible_indices.to(torch.int32).contiguous()
+        cu_seqlens_q = cu_seqlens_q.contiguous()
+        cu_seqlens_k = cu_seqlens_k.contiguous()
+        seqused_q = seqused_q.contiguous()
+        seqused_k = seqused_k.contiguous()
+        
+        # 调用 CUDA operator
+        out, softmax_lse = flash_attn_3_cuda.custom_mask_varlen_fwd(
+            q,
+            k,
+            v,
+            visible_indices,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            softmax_scale,
+            causal,
+        )
+        
+        # 保存用于反向传播的张量
+        ctx.save_for_backward(
+            q, k, v, visible_indices, out, softmax_lse,
+            cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k
+        )
+        ctx.max_seqlen_q = max_seqlen_q
+        ctx.max_seqlen_k = max_seqlen_k
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        
+        return out, softmax_lse
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        q, k, v, visible_indices, out, softmax_lse, \
+        cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
+        
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        dv = torch.empty_like(v)
+        
+        # 调用反向传播
+        _flash_attn_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            ctx.max_seqlen_q,
+            ctx.max_seqlen_k,
+            dq,
+            dk,
+            dv,
+            ctx.softmax_scale,
+            ctx.causal,
+        )
+        
+        # 返回与前向传播参数数量相匹配的梯度
+        return (dq, dk, dv, None, None, None, None, None, None, None, None, None)
+
+def flash_attn_custom_mask_varlen_func(
+    q,
+    k,
+    v,
+    visible_indices,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    seqused_q,
+    seqused_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    softmax_scale=None,
+    causal=False,
+):
+    """
+    Flash Attention with custom mask for variable sequence lengths.
+    
+    Args:
+        q: (total_q, nheads, headdim) contiguous
+        k: (total_k, nheads_k, headdim) contiguous
+        v: (total_k, nheads_k, headdim) contiguous
+        visible_indices: (total_q,) int32 tensor, indicating the last visible key index for each query
+        cu_seqlens_q: (batch_size + 1,) cumulative sequence lengths for query
+        cu_seqlens_k: (batch_size + 1,) cumulative sequence lengths for key
+        seqused_q: (batch_size,) actual sequence lengths used for query
+        seqused_k: (batch_size,) actual sequence lengths used for key
+        max_seqlen_q: int, maximum sequence length for query
+        max_seqlen_k: int, maximum sequence length for key
+        softmax_scale: float or None
+        causal: bool
+    
+    Returns:
+        out: (total_q, nheads, headdim)
+        softmax_lse: (batch_size, nheads, max_seqlen_q)
+    """
+    return FlashAttnCustomMaskVarlenFunc.apply(
+        q,
+        k,
+        v,
+        visible_indices,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        causal,
+    )
+
+
 def flash_attn_qkvpacked_func(
     qkv,
     softmax_scale=None,

@@ -163,4 +163,25 @@ struct Mask {
 
 };
 
+template<typename T>
+__device__ __forceinline__ bool check_custom_mask(
+    const int64_t query_idx,
+    const int64_t key_idx,
+    const int32_t* visible_indices
+) {
+    return key_idx <= visible_indices[query_idx];
+}
+
+template<typename T>
+__device__ __forceinline__ T apply_custom_mask(
+    T attn_value,
+    const int64_t query_idx,
+    const int64_t key_idx,
+    const int32_t* visible_indices
+) {
+    return check_custom_mask<T>(query_idx, key_idx, visible_indices) 
+           ? attn_value 
+           : -std::numeric_limits<T>::infinity();
+}
+
 } // namespace flash

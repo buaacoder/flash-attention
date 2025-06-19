@@ -166,6 +166,15 @@ public:
             }
         }
 
+        if (params.visible_indices != nullptr) {
+            score = flash::apply_custom_mask(
+                score,
+                q_idx,
+                k_idx,
+                static_cast<const int32_t*>(params.visible_indices)
+            );
+        }
+
     }
 
 };
